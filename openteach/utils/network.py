@@ -153,7 +153,7 @@ class ZMQCameraSubscriber(threading.Thread):
         raw_data = self.socket.recv()
         data = raw_data.lstrip(b"rgb_image ")
         data = pickle.loads(data)
-        encoded_data = np.fromstring(base64.b64decode(data['rgb_image']), np.uint8)
+        encoded_data = np.frombuffer(base64.b64decode(data['rgb_image']), np.uint8)
         return cv2.imdecode(encoded_data, 1), data['timestamp']
 
     def recv_depth_image(self):
@@ -186,7 +186,7 @@ class ZMQCompressedImageTransmitter(object):
         self.socket.bind('tcp://{}:{}'.format(self._host, self._port))
 
     def send_image(self, rgb_image):
-        _, buffer = cv2.imencode('.jpg', rgb_image, [int(cv2.IMWRITE_WEBP_QUALITY), 10])
+        _, buffer = cv2.imencode('.jpg', rgb_image, [int(cv2.IMWRITE_JPEG_QUALITY), 10])
         self.socket.send(np.array(buffer).tobytes())
 
     def stop(self):
@@ -215,7 +215,7 @@ class ZMQCompressedImageReciever(threading.Thread):
 
     def recv_image(self):
         raw_data = self.socket.recv()
-        encoded_data = np.fromstring(raw_data, np.uint8)
+        encoded_data = np.frombuffer(raw_data, np.uint8)
         decoded_frame = cv2.imdecode(encoded_data, 1)
         return decoded_frame
 

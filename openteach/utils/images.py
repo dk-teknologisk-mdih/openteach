@@ -10,10 +10,10 @@ def stack_images(image_array):
 
 def rotate_image(image, angle):
         if angle == 90:
-            image = cv2.rotate(image, cv2.ROTATE_90)
+            image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
         elif angle == 180:
             image = cv2.rotate(image, cv2.ROTATE_180)
         elif angle == 270:
-            image = cv2.rotate(image, cv2.ROTATE_270)
+            image = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
         return image
