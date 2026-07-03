@@ -1,7 +1,7 @@
 import hydra
 from openteach.components.initializers import FishEyeCameras
 
-@hydra.main(version_base = '1.2', config_path = 'configs', config_name = 'fisheyecamera')
+@hydra.main(version_base = '1.2', config_path = '../config', config_name = 'fisheyecamera')
 def main(configs):
     cameras =FishEyeCameras(configs)
     processes = cameras.get_processes()

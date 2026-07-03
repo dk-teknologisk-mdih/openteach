@@ -37,7 +37,7 @@ TRANSLATION_VELOCITY_LIMIT = 0.1 # 2
 
 def get_velocity_controller_config(config_root):
     controller_cfg = YamlConfig(
-        os.path.join(config_root, "osc-pose-controller-velocity.yml")
+        os.path.join(config_root, "controllers/osc-pose-controller-velocity.yml")
     ).as_easydict()
     controller_cfg = verify_controller_config(controller_cfg)
 
@@ -45,7 +45,7 @@ def get_velocity_controller_config(config_root):
 
 def get_position_controller_config(config_root):
     controller_cfg = YamlConfig(
-        os.path.join(config_root, "osc-pose-controller-position.yml")
+        os.path.join(config_root, "controllers/osc-pose-controller-position.yml")
     ).as_easydict()
     controller_cfg = verify_controller_config(controller_cfg)
 

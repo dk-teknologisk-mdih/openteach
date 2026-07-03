@@ -1,7 +1,7 @@
 import hydra
 from openteach.components import TeleOperator
 
-@hydra.main(version_base = '1.2', config_path = 'configs', config_name = 'teleop')
+@hydra.main(version_base = '1.2', config_path = '../config', config_name = 'teleop')
 def main(configs):
     teleop = TeleOperator(configs)
     processes = teleop.get_processes()

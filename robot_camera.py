@@ -16,7 +16,7 @@ for dev in devices:
 import time; time.sleep(2)
 
 
-@hydra.main(version_base = '1.2', config_path = 'configs', config_name = 'camera')
+@hydra.main(version_base = '1.2', config_path = '../config', config_name = 'camera')
 def main(configs):
     cameras = RealsenseCameras(configs)
     processes = cameras.get_processes()
