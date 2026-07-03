@@ -26,7 +26,7 @@ from deoxys.utils.config_utils import verify_controller_config
 import pickle as pkl
 
 CONTROLLER_TYPE = "OSC_POSE"
-CONFIG_ROOT = '/home/ripl/openteach/configs'
+CONFIG_ROOT = '/home/dti/Documents/VLA/config'
 
 CONTROL_FREQ = 60
 STATE_FREQ = 200
@@ -77,7 +77,7 @@ class FrankaArmOperator(Operator):
         arm_resolution_port = None,
         teleoperation_reset_port = None,
         record=None,
-        storage_location="extracted_data",
+        storage_location="../vla_data/pickle",
     ):
         self.notify_component_start('franka arm operator')
         # Subscribers for the transformed hand keypoints
@@ -112,10 +112,17 @@ class FrankaArmOperator(Operator):
         )
 
         self.deoxys_obs_cmd_history = {}
+        # has_gripper=False so that FrankaInterface.control() does NOT auto-drive
+        # the gripper from the arm action's last element. This operator sends a
+        # 6-DOF arm-only action (3 pos + 3 axis-angle) with no gripper dimension,
+        # so control() would otherwise interpret the z-rotation delta as a gripper
+        # command and flip open/close as it wobbles around zero. The gripper is
+        # controlled explicitly below via self.robot_interface.gripper_control().
         self.robot_interface = FrankaInterface(
-                os.path.join(CONFIG_ROOT, 'deoxys.yml'), use_visualizer=False,
+                os.path.join(CONFIG_ROOT, 'charmander.yml'), use_visualizer=False,
                 control_freq=CONTROL_FREQ,
-                state_freq=STATE_FREQ
+                state_freq=STATE_FREQ,
+                has_gripper=False,
             )
         self.velocity_controller_cfg = get_velocity_controller_config(
             config_root = CONFIG_ROOT
@@ -155,9 +162,28 @@ class FrankaArmOperator(Operator):
         self._timer = FrequencyTimer(VR_FREQ)
 
         self.gripper_state = None
-        self.gripper_last_msg = False
+        self.gripper_last_msg = False        # last *confirmed* pressed state
         self.gripper_cmd = -1
         self.below_thresh = False
+
+        # Gripper trigger handling. The gripper is toggled by the VR index
+        # trigger. To avoid random toggles caused by a finger resting on the
+        # trigger (which keeps a *digital* button near its threshold) we treat
+        # the trigger as an analog value with hysteresis: only a deliberate
+        # squeeze past CLOSE_THRESH counts as a press, and it must drop below
+        # OPEN_THRESH before another press is accepted. A short debounce on top
+        # rejects transient jitter / dropped frames on the CONFLATE socket.
+        self._gripper_close_thresh = 0.7
+        self._gripper_open_thresh = 0.3
+        self._gripper_pressed = False        # current (hysteresis) pressed state
+        self._gripper_stable_count = 0
+        self._gripper_debounce_count = 2
+
+        # Set to True to print every incoming gripper trigger value and toggle
+        # event. Use this to find out whether spurious gripper activations come
+        # from the VR app / controller (value goes high while idle) or not.
+        self._gripper_debug = False
+        self._gripper_last_logged = None
 
         self.logs = []
 
@@ -219,12 +245,45 @@ class FrankaArmOperator(Operator):
         return [X, Y, Z]
 
     def _get_gripper_message(self):
-        msg = self._gripper_message_subscriber.recv_keypoints()
-        if not self.gripper_last_msg and msg:
-            self.gripper_cmd *= -1
-            self.gripper_last_msg = msg
-        elif self.gripper_last_msg and not msg:
-            self.gripper_last_msg = msg
+        raw_value = self._gripper_message_subscriber.recv_keypoints()
+
+        # Accept both the new analog trigger value (0.0 .. 1.0) and the legacy
+        # boolean ("True"/"False" -> 1.0/0.0) so this works with any VR app.
+        try:
+            trigger = float(raw_value)
+        except (TypeError, ValueError):
+            trigger = 1.0 if raw_value else 0.0
+
+        # Diagnostic: log whenever the incoming trigger value changes noticeably
+        if self._gripper_debug and (self._gripper_last_logged is None or abs(trigger - self._gripper_last_logged) > 0.05):
+            print('[GRIPPER-OP] raw={} (type={}) trigger={:.3f} pressed={} cmd={}'.format(
+                raw_value, type(raw_value).__name__, trigger, self._gripper_pressed, self.gripper_cmd), flush=True)
+            self._gripper_last_logged = trigger
+
+        # Hysteresis: a finger resting on the trigger sits below CLOSE_THRESH,
+        # so it will not register as a press. In the dead-band keep the
+        # previous state.
+        if trigger >= self._gripper_close_thresh:
+            pressed = True
+        elif trigger <= self._gripper_open_thresh:
+            pressed = False
+        else:
+            pressed = self._gripper_pressed
+
+        # Debounce the (hysteresis) state to reject transient jitter.
+        if pressed == self._gripper_pressed:
+            self._gripper_stable_count += 1
+        else:
+            self._gripper_pressed = pressed
+            self._gripper_stable_count = 1
+
+        if self._gripper_stable_count >= self._gripper_debounce_count and pressed != self.gripper_last_msg:
+            if pressed:  # confirmed, deliberate rising edge -> toggle gripper
+                self.gripper_cmd *= -1
+                if self._gripper_debug:
+                    print('[GRIPPER-OP] TOGGLE -> cmd={} at trigger={:.3f}'.format(self.gripper_cmd, trigger), flush=True)
+            self.gripper_last_msg = pressed
+
         return self.gripper_cmd
 
     # Get the resolution scale mode (High or Low)
@@ -399,9 +458,17 @@ class FrankaArmOperator(Operator):
     def _controller_tracking(self):
         # See if there is a reset in the teleop
         new_arm_teleop_state = self._get_arm_teleop_state()
-        if self.is_first_frame or (self.arm_teleop_state == ARM_TELEOP_STOP and new_arm_teleop_state == ARM_TELEOP_CONT):
-            # initialize
+        arm_teleop_resumed = self.arm_teleop_state == ARM_TELEOP_STOP and new_arm_teleop_state == ARM_TELEOP_CONT
+        if arm_teleop_resumed:
+            # Re-sync the robot/hand origin whenever teleop is (re)engaged
             moving_hand_frame = self._reset_controller_teleop()
+        elif self.is_first_frame:
+            # Teleop has not been engaged yet, so there is nothing to control.
+            # Wait for the first STOP -> CONT transition before initializing,
+            # otherwise we would reset once here (while paused) and again on
+            # engage, printing the reset message twice.
+            self.arm_teleop_state = new_arm_teleop_state
+            return
         else:
             moving_hand_frame = self._get_remote_message()
         self.arm_teleop_state = new_arm_teleop_state
@@ -481,7 +548,14 @@ class FrankaArmOperator(Operator):
 
         self.robot_interface.control(
             controller_type=CONTROLLER_TYPE,
-            action=action,
+            # deoxys' control() scales rotation via action[3:last_gripper_dim]
+            # with last_gripper_dim == -1, i.e. it expects a 7-DOF action whose
+            # last element is the gripper. Passing a 6-DOF action leaves the
+            # z-axis rotation (index 5) unscaled. Append a trailing gripper
+            # placeholder so all three rotation axes are scaled correctly.
+            # (The gripper itself is driven explicitly below; has_gripper=False
+            # means deoxys ignores this trailing element.)
+            action=action + [gripper_cmd if gripper_cmd is not None else 0.0],
             controller_cfg=self.velocity_controller_cfg,
         )
 
@@ -512,7 +586,9 @@ class FrankaArmOperator(Operator):
                 #     pkl.dump(self.logs, f)
 
                 if self.record is not None and self.storage_location is not None:
-                    path = os.path.join(os.getcwd(), self.storage_location, f'deoxys_obs_cmd_history_{self.record}.pkl')
+                    storage_dir = os.path.join(os.getcwd(), self.storage_location, f'{self.record}')
+                    os.makedirs(storage_dir, exist_ok=True)
+                    path = os.path.join(storage_dir, f'deoxys_obs_cmd_history_{self.record}.pkl')
                     print('Saving the deoxys_obs_cmd_history to {}'.format(path))
                     with open(path, 'wb') as f:
                         pkl.dump(self.deoxys_obs_cmd_history, f)

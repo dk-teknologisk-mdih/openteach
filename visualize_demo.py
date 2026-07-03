@@ -14,6 +14,7 @@ from tqdm import tqdm
 import os
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import cv2
+import yaml
 import pickle as pkl
 from copy import copy
 
@@ -28,43 +29,31 @@ import warnings
 warnings.filterwarnings( "ignore")
 DEBUG = False
 
+
+def load_cam_configs():
+    """Load the camera config (e.g. whether depth is captured) from VLA/config/camera.yaml."""
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config", "camera.yaml")
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+    return config.get("cam_configs", {})
+
 # demo numer is the first argument
 def main():
     parser = argparse.ArgumentParser()
-    # add mutually exclusive args "demo_number" and "demo_folder"
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--demo_number", type=str, help="The number of the demonstration to process and visualize")
-    group.add_argument("--demo_folder", type=str, help="Process and visualize all demos in folder.")
+    parser.add_argument("--demo_number", type=str, required=True, help="The number of the demonstration to process and visualize")
     args = parser.parse_args()
 
-    if args.demo_number:
-        make_combined_video(None, args.demo_number)
-
-    elif args.demo_folder:
-        data_root = f"{os.path.expanduser('~')}/openteach/extracted_data/{args.demo_folder}"
-        if not os.path.exists(data_root):
-            raise FileNotFoundError(f"Folder {data_root} does not exist. Please check the folder name and try again.")
-        for file in os.listdir(data_root):
-            if file.endswith(".pkl"):
-                continue
-            demo_number = file.split("_")[-1].split(".")[0]
-            if os.path.exists(os.path.join(data_root, file, f"demo_{demo_number}.pkl")):
-                print(f"Demo {demo_number} already processed. Skipping...")
-                continue
-            make_combined_video(args.demo_folder, demo_number)
-
-    else:
-        raise ValueError("Either --demo_number or --demo_folder must be provided")
+    make_combined_video(args.demo_number)
 
 
-def make_combined_video(folder, demo_number):
-    root_folder = f"{os.path.expanduser('~')}/openteach/extracted_data"
-    if folder is None:
-        demo_path = os.path.join(root_folder, f"demonstration_{demo_number}")
-        cmds_path = os.path.join(root_folder, f"deoxys_obs_cmd_history_{demo_number}.pkl")
-    else:
-        demo_path = os.path.join(root_folder, f"{folder}/demonstration_{demo_number}")
-        cmds_path = os.path.join(root_folder, folder, f"deoxys_obs_cmd_history_{demo_number}.pkl")
+def make_combined_video(demo_number):
+    use_depth = bool(load_cam_configs().get("depth", False))
+    num_of_cams = int(load_cam_configs().get("num_cams", 1))
+    if not use_depth:
+        print("Depth capture disabled in camera.yaml (cam_configs.depth: False). Skipping depth data.")
+    root_folder = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vla_data", "pickle")
+    demo_path = os.path.join(root_folder, f"{demo_number}")
+    cmds_path = os.path.join(demo_path, f"deoxys_obs_cmd_history_{demo_number}.pkl")
     print(demo_path)
     depth_timestamps = []
     rgb_timestamps = []
@@ -133,22 +122,23 @@ def make_combined_video(folder, demo_number):
 
     # depth frames
     depth_frames = []
-    for j in [0, 1, 2]:
-        print(f"Loading depth images from cam_{j}...")
-        with h5py.File(f"{demo_path}/cam_{j}_depth.h5", "r") as f:
-            x = np.array(f['depth_images'])
-            for key in f.keys():
-                if key in ["orientations", "positions", "timestamps", "depth_images"]:
-                    continue
-                if DEBUG: print(key.ljust(25), f[key][()])
-            if DEBUG: print()
-            depth_timestamps.append(np.array(f["timestamps"]) / 1000)
-            # assert round(f['record_frequency'][()]) == freq
-        depth_frames.append(x)
+    if use_depth:
+        for j in range(num_of_cams):
+            print(f"Loading depth images from cam_{j}...")
+            with h5py.File(f"{demo_path}/cam_{j}_depth.h5", "r") as f:
+                x = np.array(f['depth_images'])
+                for key in f.keys():
+                    if key in ["orientations", "positions", "timestamps", "depth_images"]:
+                        continue
+                    if DEBUG: print(key.ljust(25), f[key][()])
+                if DEBUG: print()
+                depth_timestamps.append(np.array(f["timestamps"]) / 1000)
+                # assert round(f['record_frequency'][()]) == freq
+            depth_frames.append(x)
 
     # rgb frames
     rgb_frames = []
-    for j in [0, 1, 2]:
+    for j in range(num_of_cams):
         print(f"Loading rgb images from cam_{j}...")
         fname = f"cam_{j}_rgb_video.avi"
         rgb_frames.append(load_video_to_numpy_array(f"{demo_path}/{fname}"))
@@ -165,7 +155,10 @@ def make_combined_video(folder, demo_number):
         rgb_timestamps.append(np.array(metadata["timestamps"]) / 1000)
 
     # max_depth_value = max([np.max(x) for x in depth_frames]) * 0.5
-    max_depth_value = np.percentile(np.concatenate([x.flatten() for x in depth_frames]), 98)  # get rid of outliers
+    if use_depth:
+        max_depth_value = np.percentile(np.concatenate([x.flatten() for x in depth_frames]), 98)  # get rid of outliers
+    else:
+        max_depth_value = None
 
     output_data = {
         "cartesian_pose_cmd": [],
@@ -211,18 +204,20 @@ def make_combined_video(folder, demo_number):
         # pick paired rgb and depth frames. Just pick the frame that comes immediately before the timestamp
         curr_rgb_frames = []
         curr_depth_frames = []
-        for j in range(3):
+        for j in range(num_of_cams):
             # pick the smallest value that is not negative
             temp = cmd_data['timestamp'][i] - rgb_timestamps[j]
             temp[temp < 0] = np.inf
             idx = np.argmin(temp)
             curr_rgb_frames.append(rgb_frames[j][idx])
-            temp = cmd_data['timestamp'][i] - depth_timestamps[j]
-            temp[temp < 0] = np.inf
-            idx = np.argmin(temp)
-            curr_depth_frames.append(depth_frames[j][idx])
+            if use_depth:
+                temp = cmd_data['timestamp'][i] - depth_timestamps[j]
+                temp[temp < 0] = np.inf
+                idx = np.argmin(temp)
+                curr_depth_frames.append(depth_frames[j][idx])
         output_data[f"rgb_frames"].append(curr_rgb_frames)
-        output_data[f"depth_frames"].append(curr_depth_frames)
+        if use_depth:
+            output_data[f"depth_frames"].append(curr_depth_frames)
 
     for k, v in output_data.items():
         output_data[k] = np.array(v)
@@ -413,8 +408,8 @@ def make_combined_video(folder, demo_number):
 
             futures.append(executor.submit(
                 make_combined_frame,
-                [output_data["depth_frames"][i, 0], output_data["depth_frames"][i, 1], output_data["depth_frames"][i, 2]],
-                [output_data["rgb_frames"][i, 0], output_data["rgb_frames"][i, 1], output_data["rgb_frames"][i, 2]],
+                [output_data["depth_frames"][i, j] for j in range(num_of_cams)] if use_depth else None,
+                [output_data["rgb_frames"][i, j] for j in range(num_of_cams)],
                 None,  # cartesian_frames[i],
                 joint_state_plots[i],
                 i,
@@ -426,8 +421,14 @@ def make_combined_video(folder, demo_number):
             future.result()
             progress_bar.update(1)
 
-    # compile video
-    compile_video(f"demo_{demo_number}", frames_dir, demo_path)
+    # compile video at the real capture framerate so playback matches the input
+    timestamps = output_data["timestamp"]
+    if len(timestamps) > 1:
+        framerate = (len(timestamps) - 1) / (timestamps[-1] - timestamps[0])
+    else:
+        framerate = 10
+    print(f"Compiling video at {framerate:.2f} fps")
+    compile_video(f"demo_{demo_number}", frames_dir, demo_path, framerate)
 
     # # save all processed data to a .pkl file
     # data = {
@@ -623,33 +624,34 @@ def make_combined_video(folder, demo_number):
 
 def make_combined_frame(depth_frames, rgb_frames, cartesian_frames, joint_state_plot, i, max_depth_value, frames_dir):
     # get shape of rgb frames
+    num_cams = len(rgb_frames)
     h, w, _ = rgb_frames[0].shape
+    use_depth = depth_frames is not None
+    # rgb occupies the first row, depth (if captured) the second, joint plots go below
+    img_rows = h * 2 if use_depth else h
+    plot_h, plot_w = joint_state_plot.shape[:2]
+    # frame must be wide enough for the camera row and the joint state plot
+    total_w = max(w * num_cams, plot_w)
     # create a new frame
-    frame = np.zeros((h * 2 + 480, w * 3, 3), dtype=np.uint8)
+    frame = np.zeros((img_rows + plot_h, total_w, 3), dtype=np.uint8)
 
     # add depth frames. Depth frames are single channel, so need to use a colormap to convert them to rgb
-    for j, x in enumerate(depth_frames):
-        frame[h:h*2, j*w:(j+1)*w] = (plt.cm.viridis(x / max_depth_value)[:, :, :3] * 255).astype(np.uint8)
-        if j == 2:
-            # add a "2x" label to the bottom right corner with cv2
-            cv2.putText(frame, "2x", (w*3 - 50, 720 - 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+    if use_depth:
+        for j, x in enumerate(depth_frames):
+            frame[h:h*2, j*w:(j+1)*w] = (plt.cm.viridis(x / max_depth_value)[:, :, :3] * 255).astype(np.uint8)
+            if j == num_cams - 1:
+                # add a "2x" label to the bottom right corner with cv2
+                cv2.putText(frame, "2x", (w*num_cams - 50, h*2 - 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
 
     # add rgb frames
     for j, x in enumerate(rgb_frames):
         frame[0:h, j*w:(j+1)*w] = x[:, :, ::-1]
 
     # add cartesian frames
-    # frame[h*2:, :w] = (cartesian_frames[:, :, :3]).astype(np.uint8)
+    # frame[img_rows:, :w] = (cartesian_frames[:, :, :3]).astype(np.uint8)
 
-
-    joint_state_plot = np.pad(
-    joint_state_plot,
-    ((0, max(0, frame[h*2:, w:].shape[0] - joint_state_plot.shape[0])),
-     (0, max(0, frame[h*2:, w:].shape[1] - joint_state_plot.shape[1])),
-     (0, 0)),
-    mode='constant')
     # add joint state_frame
-    frame[h*2:, w:] = (joint_state_plot[..., :3]).astype(np.uint8)
+    frame[img_rows:img_rows+plot_h, 0:plot_w] = (joint_state_plot[..., :3]).astype(np.uint8)
 
     # save_combined frames
     plt.imsave(f"{frames_dir}/frame_{i:03d}.png", frame)
@@ -683,8 +685,10 @@ def make_joint_state_plots(angles, gripper_pos, gripper_cmd, idcs):
     # fig.legend(["pos", "cmd pos"], loc='upper right')
     fig.legend(["pos"], loc='upper right')
     canvas.draw()
-    image = np.frombuffer(canvas.tostring_rgb(), dtype='uint8')
-    image = image.reshape(canvas.get_width_height()[::-1] + (3,))
+    image = np.frombuffer(canvas.tostring_argb(), dtype='uint8')
+    image = image.reshape(canvas.get_width_height()[::-1] + (4,))
+    # convert ARGB to RGB by dropping the alpha channel
+    image = image[:, :, 1:]
     joint_state_plots.append(image)
     # plt.savefig(f"{demo_path}/joint_state_plots/frame_{0:03d}.png")
     # the eight plot is for gripper state
@@ -704,8 +708,10 @@ def make_joint_state_plots(angles, gripper_pos, gripper_cmd, idcs):
         # Convert the plot to a NumPy array
         canvas.draw()
         # Convert the plot to a NumPy array using ARGB
-        image = np.frombuffer(canvas.tostring_rgb(), dtype='uint8')
-        image = image.reshape(canvas.get_width_height()[::-1] + (3,))
+        image = np.frombuffer(canvas.tostring_argb(), dtype='uint8')
+        image = image.reshape(canvas.get_width_height()[::-1] + (4,))
+        # convert ARGB to RGB by dropping the alpha channel
+        image = image[:, :, 1:]
         joint_state_plots.append(image)
 
     plt.close(fig)
@@ -836,7 +842,7 @@ def q_conjugate(q):
 
 
 def make_depth_videos(demo_number):
-    demo_path = f"/home/ripl/openteach/extracted_data/demonstration_{demo_number}"
+    demo_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vla_data", "pickle", f"{demo_number}")
     frames_dir = f"{demo_path}/frames"
     for j in [0, 1, 2]:
         with h5py.File(f"{demo_path}/cam_{j}_depth.h5", "r") as f:
@@ -886,8 +892,8 @@ def run_cmd(command, env=None):
     print()
 
 
-def compile_video(vid_name, frames_dir, results_dir):
-    command = f"yes | ffmpeg -framerate 10 -i {frames_dir}/frame_%03d.png -c:v libx264 -pix_fmt yuv420p {results_dir}/{vid_name}.mp4"
+def compile_video(vid_name, frames_dir, results_dir, framerate=10):
+    command = f"yes | ffmpeg -framerate {framerate} -i {frames_dir}/frame_%03d.png -c:v libx264 -pix_fmt yuv420p {results_dir}/{vid_name}.mp4"
     run_cmd(command, env={'LD_PRELOAD': '/usr/lib/x86_64-linux-gnu/libffi.so.7'})
 
 

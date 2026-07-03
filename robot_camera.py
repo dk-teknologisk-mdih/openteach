@@ -21,13 +21,23 @@ def main(configs):
     cameras = RealsenseCameras(configs)
     processes = cameras.get_processes()
 
-    for process in processes:
-        process.start()
-        time.sleep(5)  # this prevents errors resulting from processes blocking each other's access to the realsense cameras
+    try:
+        for process in processes:
+            process.start()
+            time.sleep(5)  # this prevents errors resulting from processes blocking each other's access to the realsense cameras
 
-    for process in processes:
-        process.join()
-        time.sleep(5)
+        for process in processes:
+            process.join()
+            time.sleep(5)
+    except KeyboardInterrupt:
+        print('\nShutting down cameras...')
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+
+        for process in processes:
+            process.join()
 
 if __name__ == '__main__':
     main()

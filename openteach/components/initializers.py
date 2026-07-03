@@ -173,7 +173,7 @@ class Collector(ProcessInstantiator):
         self.demo_num = demo_num
         self._storage_path = os.path.join(
             self.configs.storage_path,
-            'demonstration_{}'.format(self.demo_num)
+            '{}'.format(self.demo_num)
         )
 
         self._create_storage_dir()

@@ -14,7 +14,7 @@ from deoxys.franka_interface import FrankaInterface
 import deoxys.proto.franka_interface.franka_controller_pb2 as franka_controller_pb2
 from deoxys.utils.config_utils import get_default_controller_config
 from deoxys.utils.log_utils import get_deoxys_example_logger
-from examples.osc_control import move_to_target_pose, deltas_move
+# from examples.osc_control import move_to_target_pose, deltas_move
 from deoxys.experimental.motion_utils import reset_joints_to
 from deoxys.utils.transform_utils import quat2axisangle, mat2euler, mat2quat, quat_distance, quat2mat, euler2mat, axisangle2quat, quat_multiply
 
@@ -36,8 +36,40 @@ from openteach.utils.timer import FrequencyTimer
 from easydict import EasyDict
 from matplotlib import pyplot as plt
 
-parser = argparse.ArgumentParser()
-parser.add_argument("demo", type=str, help="The name of the demonstration to visualize")
+# Directory containing charmander.yml and other configs (next to this script).
+CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
+
+parser = argparse.ArgumentParser(description="Replay demonstrations from .pkl or RLDS files.")
+parser.add_argument(
+    "--source", choices=["pkl", "rlds"], default="pkl",
+    help="Replay from a .pkl file or from an RLDS dataset.",
+)
+parser.add_argument(
+    "--pkl", type=str, default=None,
+    help="Path to the .pkl demonstration file (used when --source pkl).",
+)
+parser.add_argument(
+    "--rlds-dataset", type=str, default="openteach_franka",
+    help="Name of the RLDS dataset to load (used when --source rlds).",
+)
+parser.add_argument(
+    "--rlds-builder-dir", type=str, default=None,
+    help="Optional path to the RLDS dataset builder to add to sys.path (used when --source rlds).",
+)
+parser.add_argument(
+    "--rlds-data-dir", type=str,
+    default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vla_data", "rlds"),
+    help="TFDS data directory to load the RLDS dataset from (default: vla_data/rlds).",
+)
+parser.add_argument(
+    "--config-dir", type=str, default=CONFIG_DIR,
+    help="Directory containing charmander.yml.",
+)
+parser.add_argument(
+    "--control-freq", type=float, default=15.0,
+    help="Control frequency (Hz) for replay. Higher is faster; match the "
+         "data collection rate (~15 Hz) for real-time playback.",
+)
 
 DEFAULT_CONTROLLER = EasyDict({
     'controller_type': 'OSC_POSE',
@@ -65,36 +97,10 @@ DEFAULT_CONTROLLER = EasyDict({
     }
 })
 
-CMD_ACTION_CONTROLLER = EasyDict({
-    'controller_type': 'OSC_POSE',
-    'is_delta': False,
-    'traj_interpolator_cfg': {
-        'traj_interpolator_type': 'LINEAR_POSE',
-        'time_fraction': 0.3
-    },
-    'Kp': {
-        'translation': [250.0, 250.0, 250.0],
-        'rotation': [250.0, 250.0, 250.0]
-    },
-    'action_scale': {
-        'translation': 1.0,
-        'rotation': 1.0
-    },
-    'residual_mass_vec': [0.0, 0.0, 0.0, 0.0, 0.1, 0.5, 0.5],
-    'state_estimator_cfg': {
-        'is_estimation': False,
-        'state_estimator_type': 'EXPONENTIAL_SMOOTHING',
-        'alpha_q': 0.9,
-        'alpha_dq': 0.9,
-        'alpha_eef': 1.0,
-        'alpha_eef_vel': 1.0
-    }
-})
-
 def replay_from_rlds(args):
     robot_interface = FrankaInterface(
-        os.path.join('/home/ripl/openteach/configs', 'deoxys.yml'), use_visualizer=False,
-        control_freq=5,
+        os.path.join(args.config_dir, 'charmander.yml'), use_visualizer=False,
+        control_freq=args.control_freq,
         state_freq=200
     )
     reset_joint_positions = [
@@ -109,38 +115,54 @@ def replay_from_rlds(args):
     reset_joints_to(robot_interface, reset_joint_positions)
 
     # Load demonstration data
-    sys.path.append("/home/ripl/rlds_dataset_builder")
-    # ds = tfds.load("franka_pick_coke_single", split='train')
-    ds = tfds.load("franka_pick_coke_single", split='train')
+    if args.rlds_builder_dir:
+        sys.path.append(args.rlds_builder_dir)
+    ds = tfds.load(args.rlds_dataset, split='train', data_dir=args.rlds_data_dir)
 
     # timer = FrequencyTimer(15)
     for episode in ds.take(1):
         for st in episode['steps']:
             # breakpoint()
             # timer.start_loop()
-            deltas = st['action'].numpy()  # the action are deltas for (x, y, z, r, p, y, gripper)
+            action = st['action'].numpy()  # deltas for (x, y, z, r, p, y, gripper)
+            state = st['observation']['state'].numpy()  # [xyz(3), euler(3), pad(1), gripper(1)]
             cv2.imshow("image", st['observation']['image'].numpy()[:, :, ::-1])  # convert to BGR for cv2
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
-            # convert rpy to exponential axis-angle
-            deltas[3:6] = quat2axisangle(mat2quat(euler2mat(deltas[3:6])))
-            print(deltas)
+            # DEFAULT_CONTROLLER is is_delta=False, so it expects an ABSOLUTE
+            # target pose. The RLDS action is a delta, so reconstruct the
+            # absolute pose from the current EEF state exactly like the pkl path:
+            #   abs_pos  = cur_pos + delta_pos
+            #   abs_quat = delta_quat * cur_quat
+            delta_pos = action[:3]
+            delta_quat = mat2quat(euler2mat(action[3:6]))
+            cur_pos = state[:3]
+            cur_quat = mat2quat(euler2mat(state[3:6]))
+
+            target_pos = cur_pos + delta_pos
+            target_axisangle = quat2axisangle(quat_multiply(delta_quat, cur_quat))
+            arm_action = np.concatenate([target_pos, target_axisangle])
+            full_action = np.concatenate([arm_action, [action[6]]])  # include the gripper value too
+            print(" ".join(f"{v:+8.4f}" for v in full_action))
             robot_interface.control(
                     controller_type='OSC_POSE',
-                    action=deltas[:6],
+                    action=arm_action,
                     controller_cfg=DEFAULT_CONTROLLER,
                 )
-            robot_interface.gripper_control(deltas[6])
+            # RLDS gripper: 1.0 == open, 0.0 == close. gripper_control expects
+            # {-1 (open), +1 (close)}, so map back.
+            robot_interface.gripper_control(-1 if action[6] >= 0.5 else 1)
             # timer.end_loop()
 
 
 
 def replay_from_pkl(args):
-    home = os.path.expanduser("~")
-    # Load demonstration data
-    filename = f"/home/ripl/Desktop/blocks/demo_000.pkl"
-    # arm_cmd_file = f"/home/ripl/openteach/extracted_data/pick_coke/demonstration_coke18/franka_arm_tcp_commands.h5"
+    if args.pkl is None:
+        raise ValueError("--pkl must be provided when --source pkl")
+    filename = os.path.expanduser(args.pkl)
+    if not os.path.exists(filename):
+        raise FileNotFoundError(f"Demonstration file {filename} does not exist.")
     with open(filename, 'rb') as dbfile:
         db = pkl.load(dbfile)
     # breakpoint()
@@ -167,8 +189,8 @@ def replay_from_pkl(args):
     # plt.show()
     # breakpoint()
     robot_interface = FrankaInterface(
-        os.path.join('/home/ripl/openteach/configs', 'deoxys.yml'), use_visualizer=False,
-        control_freq=5,  # setting control frequency here so we don't have to handle it with a timer
+        os.path.join(args.config_dir, 'charmander.yml'), use_visualizer=False,
+        control_freq=args.control_freq,  # setting control frequency here so we don't have to handle it with a timer
         state_freq=200
     )
     # timer = FrequencyTimer(15)
@@ -179,7 +201,8 @@ def replay_from_pkl(args):
         # timer.start_loop()
 
         deltas = arm_action[i]
-
+        full_action = np.concatenate([deltas, [db["gripper_action"][i]]])  # include the gripper value too
+        print(" ".join(f"{v:+8.4f}" for v in full_action))
         robot_interface.control(
                 controller_type=DEFAULT_CONTROLLER["controller_type"],
                 action=deltas,
@@ -192,5 +215,7 @@ def replay_from_pkl(args):
 
 if __name__ == "__main__":
     args = parser.parse_args()
-    replay_from_pkl(args)
-    # replay_from_rlds(args)
+    if args.source == "rlds":
+        replay_from_rlds(args)
+    else:
+        replay_from_pkl(args)

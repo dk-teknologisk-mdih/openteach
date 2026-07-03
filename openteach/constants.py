@@ -34,7 +34,7 @@ OCULUS_VIEW_LIMITS = {
     'z_limits': [-0.04, 0.04]
 }
 
-VR_FREQ = 5  # 15
+VR_FREQ = 30  # was 5; raise for smoother teleop (operator command rate in Hz)
 BIMANUAL_VR_FREQ = 90
 LIBERO_FREQ = 20
 
