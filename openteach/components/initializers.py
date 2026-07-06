@@ -243,6 +243,11 @@ class Collector(ProcessInstantiator):
 
     #Function to start the camera recorders
     def _init_camera_recorders(self):
+        # Only record depth when it is enabled in the camera config. When
+        # cam_configs.depth is False the cameras never publish depth frames, so
+        # starting a depth recorder would just block on an empty stream (and
+        # raise an uncaught KeyboardInterrupt traceback on shutdown).
+        record_depth = bool(self.configs.cam_configs.depth)
         if self.configs.sim_env is not True:
             print("Camera recorder starting")
             for cam_idx in range(len(self.configs.robot_cam_serial_numbers)):
@@ -252,10 +257,11 @@ class Collector(ProcessInstantiator):
                     args = (cam_idx, )
                 ))
 
-                self.processes.append(Process(
-                    target = self._start_depth_component,
-                    args = (cam_idx, )
-                ))
+                if record_depth:
+                    self.processes.append(Process(
+                        target = self._start_depth_component,
+                        args = (cam_idx, )
+                    ))
         else:
 
             for cam_idx in range(len(self.configs.robot_cam_serial_numbers)):
@@ -264,10 +270,11 @@ class Collector(ProcessInstantiator):
                     args = (cam_idx, )
                 ))
 
-                self.processes.append(Process(
-                    target = self._start_depth_component,
-                    args = (cam_idx, )
-                ))
+                if record_depth:
+                    self.processes.append(Process(
+                        target = self._start_depth_component,
+                        args = (cam_idx, )
+                    ))
 
     #Function to start the sim recorders
     def _init_sim_recorders(self):

@@ -132,6 +132,8 @@ class OculusVRHandDetector(Component):
                 # Publish Pause Data
                 self._publish_pause_data(pause_status)
                 self.timer.end_loop()
+            except KeyboardInterrupt:
+                break
             except Exception as e:
                 print(e)
                 break
