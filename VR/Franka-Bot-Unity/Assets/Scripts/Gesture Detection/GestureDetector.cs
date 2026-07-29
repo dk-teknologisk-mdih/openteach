@@ -40,6 +40,7 @@ class GestureDetector : MonoBehaviour
 
     // Mode
     private int currentMode = 0;
+    private float advanceRequestUntil = 0f;
 
     // Start function
     void Start()
@@ -125,7 +126,7 @@ class GestureDetector : MonoBehaviour
 
     public void SendRemoteData(String TypeMarker)
     {
-        // Message needs to contain Marker|x,y,z|q1,q2,q3,q4|gripper|offset_forward,offset_right,offset_up
+        // Message needs to contain Marker|x,y,z|q1,q2,q3,q4|gripper|offset_forward|offset_right|offset_up|advance
         Vector3 pos = OVRInput.GetLocalControllerPosition(RightController);
         Quaternion quat = OVRInput.GetLocalControllerRotation(RightController);
         Vector3 offsetForward = pos + controllerTransform.forward * 0.1f;
@@ -139,7 +140,8 @@ class GestureDetector : MonoBehaviour
         message = message + OVRInput.Get(OVRInput.RawButton.RIndexTrigger) + "|";
         message = message + offsetForward.x + "," + offsetForward.y + "," + offsetForward.z + "|";
         message = message + offsetRight.x + "," + offsetRight.y + "," + offsetRight.z + "|";
-        message = message + offsetUp.x + "," + offsetUp.y + "," + offsetUp.z;
+        message = message + offsetUp.x + "," + offsetUp.y + "," + offsetUp.z + "|";
+        message = message + (Time.unscaledTime < advanceRequestUntil);
 
         bool sent = RemoteClient.TrySendFrame(message);
         if (!sent) {
@@ -207,6 +209,13 @@ class GestureDetector : MonoBehaviour
     void Update()
     {
         changeColorScript.SetColor(controllerColor);  // Update controller color
+        if (OVRInput.GetDown(OVRInput.RawButton.A))
+        {
+            // Keep the event in the conflated controller stream long enough
+            // for the Python receiver to observe it once.
+            advanceRequestUntil = Time.unscaledTime + 0.5f;
+        }
+
         // Hand Tracking
         if (RemoteConnectionEstablished)
 
@@ -217,8 +226,9 @@ class GestureDetector : MonoBehaviour
 
                 StreamPauser();  // check if B was pressed to bring up the menu
 
-                // Stream Data
-                if (StreamAbsoluteData)
+                // Stream controller packets while active and while an A event
+                // is latched, so A can finish a paused sequence as well.
+                if (StreamAbsoluteData || Time.unscaledTime < advanceRequestUntil)
                     SendRemoteData("absolute");
                 
             }

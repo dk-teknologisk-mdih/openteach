@@ -1,7 +1,9 @@
-from openteach.constants import VR_FREQ,  ARM_LOW_RESOLUTION, ARM_HIGH_RESOLUTION ,ARM_TELEOP_STOP,ARM_TELEOP_CONT
 from openteach.components import Component
+from openteach.constants import (ARM_HIGH_RESOLUTION, ARM_LOW_RESOLUTION,
+                                 ARM_TELEOP_CONT, ARM_TELEOP_STOP, VR_FREQ)
+from openteach.utils.network import (ZMQButtonFeedbackSubscriber,
+                                     ZMQKeypointPublisher, create_pull_socket)
 from openteach.utils.timer import FrequencyTimer
-from openteach.utils.network import create_pull_socket, ZMQKeypointPublisher, ZMQButtonFeedbackSubscriber
 
 
 class OculusVRHandDetector(Component):
@@ -56,7 +58,7 @@ class OculusVRHandDetector(Component):
 
     def _extract_remote_data(self, message):
         data = self._process_data_token(message)
-        typemarker, pos, quat, gripper, offset_forward, offset_right, offset_up = data.split('|')
+        typemarker, pos, quat, gripper, offset_forward, offset_right, offset_up, advance = data.split('|')
         remote_pose = []
         for val in pos.split(','):
             remote_pose.append(float(val))
@@ -69,7 +71,7 @@ class OculusVRHandDetector(Component):
 
         offset_R = [offset_forward, offset_right, offset_up]
 
-        return remote_pose, gripper, offset_R
+        return remote_pose, gripper, offset_R, advance == 'True'
 
     # Function to Publish the transformed Keypoints
     def _publish_data(self, keypoint_dict):
@@ -93,9 +95,9 @@ class OculusVRHandDetector(Component):
         )
 
     # Function to Publish the Remote Pose
-    def _publish_remote_message(self, remote_pose, offset_R):
+    def _publish_remote_message(self, remote_pose, offset_R, advance):
         self.remote_pose_publisher.pub_keypoints(
-            keypoint_array = [remote_pose, offset_R],
+            keypoint_array = [remote_pose, offset_R, advance],
             topic_name = 'remote_msg'
         )
 
@@ -114,9 +116,9 @@ class OculusVRHandDetector(Component):
                 self.timer.start_loop()
 
                 # Getting remote message
-                # TypeMarker|x,y,z|q1,q2,q3,q4|gripper|offset_forward,offset_right,offset_up
+                # TypeMarker|x,y,z|q1,q2,q3,q4|gripper|offset_forward|offset_right|offset_up|advance
                 remote_message = self.remote_socket.recv()
-                remote_pose, gripper, offset_R = self._extract_remote_data(remote_message)
+                remote_pose, gripper, offset_R, advance = self._extract_remote_data(remote_message)
 
                 # Getting the Teleop Reset Status
                 pause_status = self.teleop_reset_socket.recv()
@@ -126,7 +128,7 @@ class OculusVRHandDetector(Component):
                     pause_status = ARM_TELEOP_CONT
 
                 # Publish Remote Pose with offsets and Gripper
-                self._publish_remote_message(remote_pose, offset_R)
+                self._publish_remote_message(remote_pose, offset_R, advance)
                 self._publish_gripper_message(gripper)
 
                 # Publish Pause Data
