@@ -1,29 +1,26 @@
-import numpy as np
-import matplotlib.pyplot as plt
-import zmq
-import time
-
-from mpl_toolkits.mplot3d import Axes3D
-from tqdm import tqdm
-
-from copy import deepcopy as copy
-from openteach.constants import *
-from openteach.utils.timer import FrequencyTimer
-from openteach.utils.network import ZMQKeypointSubscriber, ZMQKeypointPublisher
-from openteach.utils.vectorops import *
-from openteach.utils.files import *
-# from openteach.robot.franka import FrankaArm
-from scipy.spatial.transform import Rotation, Slerp
-from .operator import Operator
+import pickle as pkl
 import random
+import time
+from copy import deepcopy as copy
 
+import matplotlib.pyplot as plt
+import numpy as np
+import zmq
 from deoxys.franka_interface import FrankaInterface
 from deoxys.utils import transform_utils
-from deoxys.utils.config_utils import YamlConfig
-from deoxys.utils.config_utils import verify_controller_config
+from deoxys.utils.config_utils import YamlConfig, verify_controller_config
+from mpl_toolkits.mplot3d import Axes3D
+# from openteach.robot.franka import FrankaArm
+from scipy.spatial.transform import Rotation, Slerp
+from tqdm import tqdm
 
+from openteach.constants import *
+from openteach.utils.files import *
+from openteach.utils.network import ZMQKeypointPublisher, ZMQKeypointSubscriber
+from openteach.utils.timer import FrequencyTimer
+from openteach.utils.vectorops import *
 
-import pickle as pkl
+from .operator import Operator
 
 CONTROLLER_TYPE = "OSC_POSE"
 CONFIG_ROOT = '/home/dti/Documents/VLA/config'
@@ -186,6 +183,8 @@ class FrankaArmOperator(Operator):
         self._gripper_last_logged = None
 
         self.logs = []
+        self._advance_button_pressed = False
+        self._sequence_advance_requested = False
 
 
     @property
@@ -220,11 +219,12 @@ class FrankaArmOperator(Operator):
         for i in range(10):
             data = self.remote_message_subscriber.recv_keypoints()
             if not data is None: break
-        if data is None: return None
+        if data is None: return None, False
         # pose is x, y, z, qx, qy, qz, qw
         # need to transform this to a (4,3) pose matrix
         remote_pose = np.array(data[0])
         offset_R = np.array(data[1])
+        advance = bool(data[2]) if len(data) > 2 else False
 
         t = np.array(remote_pose[:3])
         R = self._get_dir_frame(remote_pose[:3], offset_R)
@@ -234,7 +234,12 @@ class FrankaArmOperator(Operator):
 
         remote_frame = np.vstack([t, R])
 
-        return remote_frame
+        return remote_frame, advance
+
+    def _check_sequence_advance(self, advance):
+        requested = advance and not self._advance_button_pressed
+        self._advance_button_pressed = advance
+        return requested
 
     # Create a coordinate frame for the arm
     def _get_dir_frame(self, base, offset):
@@ -393,13 +398,13 @@ class FrankaArmOperator(Operator):
         # Just updates the beginning position of the arm
         print('****** RESETTING TELEOP ****** ')
         self.robot_init_H = self.robot_interface.last_eef_pose
-        first_hand_frame = self._get_remote_message()
+        first_hand_frame, advance = self._get_remote_message()
         while first_hand_frame is None:
-            first_hand_frame = self._get_remote_message()
+            first_hand_frame, advance = self._get_remote_message()
         self.hand_init_H = self._turn_frame_to_homo_mat(first_hand_frame)
         self.hand_init_t = copy(self.hand_init_H[:3, 3])
         self.is_first_frame = False
-        return first_hand_frame
+        return first_hand_frame, advance
 
     # Apply the retargeted angles
     def _apply_retargeted_angles(self, log=False):
@@ -461,16 +466,20 @@ class FrankaArmOperator(Operator):
         arm_teleop_resumed = self.arm_teleop_state == ARM_TELEOP_STOP and new_arm_teleop_state == ARM_TELEOP_CONT
         if arm_teleop_resumed:
             # Re-sync the robot/hand origin whenever teleop is (re)engaged
-            moving_hand_frame = self._reset_controller_teleop()
+            moving_hand_frame, advance = self._reset_controller_teleop()
         elif self.is_first_frame:
-            # Teleop has not been engaged yet, so there is nothing to control.
-            # Wait for the first STOP -> CONT transition before initializing,
-            # otherwise we would reset once here (while paused) and again on
-            # engage, printing the reset message twice.
+            # Wait for a controller packet here so A can advance an unused,
+            # paused sequence without first engaging teleoperation with B.
+            _, advance = self._get_remote_message()
+            if self._check_sequence_advance(advance):
+                self._sequence_advance_requested = True
             self.arm_teleop_state = new_arm_teleop_state
             return
         else:
-            moving_hand_frame = self._get_remote_message()
+            moving_hand_frame, advance = self._get_remote_message()
+        if self._check_sequence_advance(advance):
+            self._sequence_advance_requested = True
+            return
         self.arm_teleop_state = new_arm_teleop_state
 
         if moving_hand_frame is None:
@@ -562,6 +571,24 @@ class FrankaArmOperator(Operator):
         if gripper_cmd is not None:
             self.robot_interface.gripper_control(gripper_cmd)
 
+    def _finalize_recording(self, sequence_advance=False):
+        if self.record is None or self.storage_location is None:
+            return
+
+        storage_dir = os.path.join(os.getcwd(), self.storage_location, f'{self.record}')
+        os.makedirs(storage_dir, exist_ok=True)
+        path = os.path.join(storage_dir, f'deoxys_obs_cmd_history_{self.record}.pkl')
+        print('Saving the deoxys_obs_cmd_history to {}'.format(path))
+        with open(path, 'wb') as f:
+            pkl.dump(self.deoxys_obs_cmd_history, f)
+
+        if sequence_advance:
+            marker_path = os.path.join(storage_dir, '.quest_a_advance')
+            temporary_marker_path = marker_path + '.tmp'
+            with open(temporary_marker_path, 'w') as f:
+                f.write('sequence advance requested\n')
+            os.replace(temporary_marker_path, marker_path)
+
     def stream(self):
         self.notify_component_start('franka control')
         print("Start controlling the robot hand using the Oculus Headset.\n")
@@ -577,6 +604,10 @@ class FrankaArmOperator(Operator):
                     # self._apply_retargeted_angles(log=False)
                     self._controller_tracking()
 
+                    if self._sequence_advance_requested:
+                        self._finalize_recording(sequence_advance=True)
+                        break
+
                     self.timer.end_loop()
                 # else:
                 #     print('No robot state.. try activating deadman switch')
@@ -585,14 +616,7 @@ class FrankaArmOperator(Operator):
                 # with open('logs.pkl', 'wb') as f:
                 #     pkl.dump(self.logs, f)
 
-                if self.record is not None and self.storage_location is not None:
-                    storage_dir = os.path.join(os.getcwd(), self.storage_location, f'{self.record}')
-                    os.makedirs(storage_dir, exist_ok=True)
-                    path = os.path.join(storage_dir, f'deoxys_obs_cmd_history_{self.record}.pkl')
-                    print('Saving the deoxys_obs_cmd_history to {}'.format(path))
-                    with open(path, 'wb') as f:
-                        pkl.dump(self.deoxys_obs_cmd_history, f)
-                        # pkl.dump(self.robot._controller.franka.deoxys_obs_cmd_history, f)
+                self._finalize_recording()
                 break
             except Exception as e:
                 print(e)
