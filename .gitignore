@@ -29,3 +29,6 @@ urdf/*
 
 # Logs
 logs/*
+
+# Unity output files
+output/
