@@ -62,6 +62,14 @@ parser.add_argument(
     help="TFDS data directory to load the RLDS dataset from (default: vla_data/rlds).",
 )
 parser.add_argument(
+    "--demo-name", type=str, default=None,
+    help="Which RLDS episode to replay, identified by its source demo name "
+         "(used when --source rlds). This is the '<name>' in the source "
+         "'demo_<name>.pkl' file, e.g. 'red_block_in_cardboard_19'. The dataset "
+         "is scanned and the matching episode is replayed. If omitted, the "
+         "first episode is replayed.",
+)
+parser.add_argument(
     "--config-dir", type=str, default=CONFIG_DIR,
     help="Directory containing charmander.yml.",
 )
@@ -119,8 +127,33 @@ def replay_from_rlds(args):
         sys.path.append(args.rlds_builder_dir)
     ds = tfds.load(args.rlds_dataset, split='train', data_dir=args.rlds_data_dir)
 
+    def _file_path(episode):
+        fp = episode['episode_metadata']['file_path'].numpy()
+        return fp.decode('utf-8') if isinstance(fp, bytes) else fp
+
+    # Select the episode to replay. TFDS shuffles episodes, so the demo name
+    # does not correspond to a fixed index; scan the dataset and match on the
+    # source pkl basename ('demo_<name>.pkl').
+    if args.demo_name is not None:
+        target = f"demo_{args.demo_name}.pkl"
+        chosen = None
+        for episode in ds:
+            if os.path.basename(_file_path(episode)) == target:
+                chosen = episode
+                break
+        if chosen is None:
+            raise SystemExit(
+                f"No episode found for demo '{args.demo_name}' "
+                f"(looking for '{target}') in dataset '{args.rlds_dataset}'."
+            )
+        episodes = [chosen]
+    else:
+        episodes = ds.take(1)
+
     # timer = FrequencyTimer(15)
-    for episode in ds.take(1):
+    for episode in episodes:
+        # Report which source demo this episode came from.
+        print(f"Replaying RLDS episode from: {_file_path(episode)}")
         for st in episode['steps']:
             # breakpoint()
             # timer.start_loop()
@@ -135,10 +168,16 @@ def replay_from_rlds(args):
             # absolute pose from the current EEF state exactly like the pkl path:
             #   abs_pos  = cur_pos + delta_pos
             #   abs_quat = delta_quat * cur_quat
+            #
+            # The RLDS euler angles were produced by 3_convert_data_to_rlds.py
+            # with scipy's as_euler("xyz") (extrinsic xyz == Rz*Ry*Rx). deoxys'
+            # euler2mat uses the REVERSE order (Rx*Ry*Rz), so reconstruct with
+            # scipy here to match the convention the dataset was written with,
+            # otherwise the wrist/yaw rotates the wrong way.
             delta_pos = action[:3]
-            delta_quat = mat2quat(euler2mat(action[3:6]))
+            delta_quat = mat2quat(R.from_euler("xyz", action[3:6]).as_matrix())
             cur_pos = state[:3]
-            cur_quat = mat2quat(euler2mat(state[3:6]))
+            cur_quat = mat2quat(R.from_euler("xyz", state[3:6]).as_matrix())
 
             target_pos = cur_pos + delta_pos
             target_axisangle = quat2axisangle(quat_multiply(delta_quat, cur_quat))
