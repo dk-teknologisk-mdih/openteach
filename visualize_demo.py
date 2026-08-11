@@ -31,11 +31,11 @@ DEBUG = False
 
 
 def load_cam_configs():
-    """Load the camera config (e.g. whether depth is captured) from VLA/config/camera.yaml."""
+    """Load the full camera config from VLA/config/camera.yaml."""
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config", "camera.yaml")
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
-    return config.get("cam_configs", {})
+    return config
 
 # demo numer is the first argument
 def main():
@@ -47,8 +47,10 @@ def main():
 
 
 def make_combined_video(demo_number):
-    use_depth = bool(load_cam_configs().get("depth", False))
-    num_of_cams = int(load_cam_configs().get("num_cams", 1))
+    cam_yaml = load_cam_configs()
+    use_depth = bool(cam_yaml.get("cam_configs", {}).get("depth", False))
+    # num_cams is a top-level key in camera.yaml (not inside cam_configs).
+    num_of_cams = int(cam_yaml.get("num_cams", 1))
     if not use_depth:
         print("Depth capture disabled in camera.yaml (cam_configs.depth: False). Skipping depth data.")
     root_folder = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vla_data", "pickle")
@@ -344,7 +346,7 @@ def make_combined_video(demo_number):
     print(f"Total number of final frames in demo: {num_frames}")
 
     # print("\nGenerating joint state plots and cartesian plots...\n")
-    print("\nGenerating joint state plots...\n")
+    print("\nGenerating cartesian state plots...\n")
     # split the range up into equal parts equal to the number of workers
     with ProcessPoolExecutor(max_workers=workers) as executor:
         chunk_size = num_frames // (workers - 1)
@@ -353,9 +355,9 @@ def make_combined_video(demo_number):
             start = i * chunk_size
             end = (i + 1) * chunk_size
             joint_futures.append(executor.submit(
-                make_joint_state_plots,
-                output_data["joint_pos"],
-                # more_data["q_d"][start_idcs[7]: end_idcs[7]],
+                make_cartesian_state_plots,
+                output_data["eef_pos"],
+                output_data["eef_quat"],
                 output_data["gripper_state"],
                 output_data["gripper_action"],
                 np.arange(start, end)
@@ -368,9 +370,9 @@ def make_combined_video(demo_number):
         if remainder > 0:
             # add the remainder
             joint_futures.append(executor.submit(
-                make_joint_state_plots,
-                output_data["joint_pos"],
-                # more_data["q_d"][start_idcs[7]: end_idcs[7]],
+                make_cartesian_state_plots,
+                output_data["eef_pos"],
+                output_data["eef_quat"],
                 output_data["gripper_state"],
                 output_data["gripper_action"],
                 np.arange(end, num_frames)
@@ -658,26 +660,43 @@ def make_combined_frame(depth_frames, rgb_frames, cartesian_frames, joint_state_
 
 
 # def make_joint_state_plots(angles, q_d, gripper_pos, gripper_cmd, idcs):
-def make_joint_state_plots(angles, gripper_pos, gripper_cmd, idcs):
-    # make 2 x 4 subplots for 7 joints. Figure size should have a height of 480 and width of 1280. Return fig as an np array.
-    # make dir joint_state_plots
+def make_cartesian_state_plots(eef_pos, eef_quat, gripper_pos, gripper_cmd, idcs):
+    # make 2 x 4 subplots for the cartesian EEF pose (x/y/z position + euler angles)
+    # and the gripper. Figure size should have a height of 480 and width of 1280.
+    # Return fig as an np array.
+    from scipy.spatial.transform import Rotation as R
     joint_state_plots = []
+
+    # eef_pos entries come from deoxys as (3, 1) arrays; flatten to (N, 3)/(N, 4)
+    eef_pos = np.asarray(eef_pos).reshape(len(eef_pos), -1)
+    eef_quat = np.asarray(eef_quat).reshape(len(eef_quat), -1)
+    # deoxys quats are (x, y, z, w), matching scipy's convention
+    eef_euler = np.unwrap(R.from_quat(eef_quat).as_euler("xyz"), axis=0)
+    titles = ["EEF X [m]", "EEF Y [m]", "EEF Z [m]",
+              "Roll [rad]", "Pitch [rad]", "Yaw [rad]"]
 
     fig, axs = plt.subplots(2, 4, figsize=(1280/100, 480/100))
     vlines = []
+    active_axes = []
     canvas = FigureCanvas(fig)
     for i in range(8):
         ax = axs[i // 4, i % 4]
+        if i == 6:
+            ax.axis('off')
+            continue
         if i ==7:
             ax.plot(gripper_pos, antialiased=True)
             ax.plot(gripper_cmd, antialiased=True)
             ax.set_title(f"Gripper", antialiased=True)
+        elif i < 3:
+            ax.plot(eef_pos[:, i], antialiased=True)
+            ax.set_title(titles[i], antialiased=True)
         else:
-            ax.plot(angles[:, i], antialiased=True)
-            # ax.plot(q_d[:, i], antialiased=True)
-            ax.set_title(f"Joint {i+1}", antialiased=True)
+            ax.plot(eef_euler[:, i - 3], antialiased=True)
+            ax.set_title(titles[i], antialiased=True)
         ax.grid()
         # draw a vertical red line corresponding to the timestep
+        active_axes.append(ax)
         vlines.append(ax.axvline(idcs[0], color='r'))
     plt.tight_layout()
     # Convert the plot to a NumPy array
@@ -693,15 +712,12 @@ def make_joint_state_plots(angles, gripper_pos, gripper_cmd, idcs):
     # plt.savefig(f"{demo_path}/joint_state_plots/frame_{0:03d}.png")
     # the eight plot is for gripper state
     for j in range(1, idcs.shape[0]):
-        for i in range(8):
-            # erase previous red line
-            ax = axs[i // 4, i % 4]
-            # ax.lines.pop(1)
-            vlines[i].remove()
+        # erase previous red lines
+        for vline in vlines:
+            vline.remove()
         vlines = []
-        for i in range(8):
+        for ax in active_axes:
             # draw a vertical red line corresponding to the timestep
-            ax = axs[i // 4, i % 4]
             vlines.append(ax.axvline(idcs[j], color='r'))
             # Draw the canvas to update the figure
 
